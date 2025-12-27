@@ -1,0 +1,18 @@
+[project]
+name = "geo-grid"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "branca>=0.8.2",
+    "folium>=0.20.0",
+    "geopandas>=1.1.2",
+    "ipykernel>=7.1.0",
+    "mapclassify>=2.10.0",
+    "matplotlib>=3.10.8",
+    "numpy>=2.4.0",
+    "pandas>=2.3.3",
+    "pyproj>=3.7.2",
+    "shapely>=2.1.2",
+]
