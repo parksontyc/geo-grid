@@ -1,4 +1,5 @@
 # Raw data of addr-to-geo project
+data/
 SHP/
 .ipynb_checkpoints
 
