@@ -93,7 +93,6 @@ MediumCategory = {
     '96': '未分類其他服務業'
 }
 
-
 # 稅籍小類代碼
 Subcategory = {
     '011': '農作物栽培業',
