@@ -1,6 +1,8 @@
 from __future__ import annotations
 import re
-from typing import Dict, Tuple, Union, List
+import os
+import time
+from typing import Dict, Tuple, Union, List, Optional
 
 import sys
 from pathlib import Path
@@ -10,6 +12,9 @@ sys.path.append(str(project_root))
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
+from dotenv import load_dotenv
+import requests
+from urllib.parse import quote
 
 
 from utils.id_category import MediumCategory, Subcategory, DetailedSubcategory
@@ -634,3 +639,175 @@ def fill_company_and_branch_by_id(
 
     return df
 
+#=====tdx-token===================================
+load_dotenv()
+
+url = 'https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token'
+headers = {'content-type': 'application/x-www-form-urlencoded'}
+
+data = {
+    'grant_type': 'client_credentials',
+    'client_id': f'{os.getenv("client_id")}',
+    'client_secret': f'{os.getenv("client_secret")}'
+}
+
+response = requests.post(url, headers=headers, data=data)
+print(response.json())
+token = response.json()['access_token']
+
+
+#=====取得座標===================================
+POINT_RE = re.compile(r"POINT\s*\(\s*([-+]?\d+(?:\.\d+)?)\s+([-+]?\d+(?:\.\d+)?)\s*\)")
+
+def _parse_point_wkt(geometry: str) -> Optional[tuple]:
+    if not geometry:
+        return None
+    m = POINT_RE.search(geometry)
+    if not m:
+        return None
+    lon = float(m.group(1))
+    lat = float(m.group(2))
+    return lon, lat
+
+def geocode_tdx_df(
+    df: pd.DataFrame,
+    token: str,
+    addr_col: str = "正規化營業地址",
+    out_addr_col: str = "coords_address",
+    out_lon_col: str = "longitude",
+    out_lat_col: str = "latitude",
+    requests_per_second: int = 10,
+    pause_every: int = 45,
+    pause_seconds: int = 60,
+    timeout: int = 12,
+    max_retries: int = 3,
+    only_fill_na: bool = True,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    修改說明：
+    1. 新增 api_request_count 變數，統計實際發查次數。
+    2. 在暫停與結束時輸出統計資訊。
+    """
+    # 欄位準備
+    if out_addr_col not in df.columns:
+        df.insert(df.columns.get_loc(addr_col) + 1, out_addr_col, pd.NA)
+    if out_lon_col not in df.columns:
+        df.insert(df.columns.get_loc(out_addr_col) + 1, out_lon_col, pd.NA)
+    if out_lat_col not in df.columns:
+        df.insert(df.columns.get_loc(out_lon_col) + 1, out_lat_col, pd.NA)
+
+    # 速率限制參數
+    min_interval = 1.0 / max(1, requests_per_second)
+    last_ts = 0.0
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+    total = len(df)
+    processed = 0          # 總共遍歷了幾列 (包含跳過的)
+    api_request_count = 0  # 實際發查了幾筆 (沒有跳過的)
+
+    print(f"--- 開始處理，共 {total} 筆資料 ---")
+
+    for idx, row in df.iterrows():
+        # 1. 檢查輸入地址是否存在
+        addr = row.get(addr_col, None)
+        if not isinstance(addr, str) or not addr.strip():
+            processed += 1
+            continue
+
+        # 2. 檢查是否需要發查 (only_fill_na 邏輯)
+        if only_fill_na is True:
+            existing_val = row.get(out_addr_col)
+            if pd.notna(existing_val) and str(existing_val).strip() != "":
+                processed += 1
+                continue
+
+        # --- 確定要發查了，計數器 +1 ---
+        api_request_count += 1
+
+        # 3. 批次暫停機制 (修改顯示資訊)
+        # 注意：這裡用 api_request_count 來判斷暫停可能比較合理(避免跳過的也算次數)，
+        # 但為了維持您原本的邏輯(每處理N行暫停)，這裡維持用 processed 或 api_request_count 皆可。
+        # 這裡建議：如果擔心跳過太多導致連續發查過快，可以維持用 processed；
+        # 但通常是為了省 API 額度或休息，這裡我加入 顯示實際發查數。
+        if pause_every > 0 and processed > 0 and processed % pause_every == 0:
+            if verbose:
+                print(f"[Info] 進度 {processed}/{total} (實際發查: {api_request_count} 筆)，暫停 {pause_seconds} 秒...")
+            time.sleep(pause_seconds)
+
+        # 4. 速率限制
+        now = time.time()
+        elapsed = now - last_ts
+        if elapsed < min_interval:
+            time.sleep(min_interval - elapsed)
+
+        # 5. 呼叫 API
+        url = f"https://tdx.transportdata.tw/api/advanced/V3/Map/GeoCode/Coordinate/Address/{quote(addr)}?format=JSON"
+
+        success = False
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = requests.get(url, headers=headers, timeout=timeout)
+                last_ts = time.time()
+
+                if resp.status_code in (401, 403):
+                    raise RuntimeError(f"TDX token 失效或權限不足（HTTP {resp.status_code}）。")
+
+                if resp.status_code != 200:
+                    if verbose:
+                        print(f"[Warn] {addr} 回應 {resp.status_code}，第 {attempt}/{max_retries} 次重試。")
+                    time.sleep(min(2 ** attempt, 5))
+                    continue
+
+                data = resp.json()
+                if isinstance(data, list) and len(data) > 0:
+                    geometry = data[0].get("Geometry")
+                    coords_addr = data[0].get("Address")
+                    pt = _parse_point_wkt(geometry)
+                    
+                    if pt:
+                        lon, lat = pt
+                        df.at[idx, out_addr_col] = coords_addr
+                        df.at[idx, out_lon_col] = lon
+                        df.at[idx, out_lat_col] = lat
+                        success = True
+                        if verbose:
+                            # 顯示目前是第幾筆實際發查
+                            print(f"[OK] #{api_request_count} | {addr} → ({lon:.5f}, {lat:.5f})")
+                        break
+                    else:
+                        if verbose:
+                            print(f"[Warn] 幾何解析失敗，重試中...")
+                        time.sleep(min(2 ** attempt, 5))
+                        continue
+                else:
+                    if verbose:
+                        print(f"[Info] #{api_request_count} | {addr} 查無資料。")
+                    success = True 
+                    break
+
+            except Exception as e:
+                if attempt >= max_retries:
+                    if verbose:
+                        print(f"[Error] {addr} 最終失敗：{e}")
+                else:
+                    if verbose:
+                        print(f"[Warn] 發生錯誤：{e}，重試中...")
+                    time.sleep(min(2 ** attempt, 5))
+
+        processed += 1
+
+    # --- 最終統計 ---
+    if verbose:
+        print("-" * 30)
+        print(f"處理完成！")
+        print(f"總筆數 (Total Rows): {total}")
+        print(f"實際發查 (API Calls): {api_request_count}")
+        print(f"跳過筆數 (Skipped): {total - api_request_count}")
+        print("-" * 30)
+
+    return df
