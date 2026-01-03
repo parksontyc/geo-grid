@@ -811,3 +811,86 @@ def geocode_tdx_df(
         print("-" * 30)
 
     return df
+
+
+#=====型態：目的/補給型===========================
+def add_catering_type_column(df, source_col) -> pd.DataFrame:
+    """
+    根據指定的來源欄位，為 DataFrame 新增一個 '型態' 欄位，
+    區分為 '目的型' 與 '補給型'。
+
+    參數:
+    df (pd.DataFrame): 您的 catering_services 資料框
+    source_col (str): 用來判斷類別的欄位名稱 (例如 '細類' 或 '營業項目')
+
+    回傳:
+    pd.DataFrame: 處理完成的資料框
+    """
+    
+    # 1. 定義分類清單
+    # 目的型清單
+    destination_type = [
+        '餐廳', '吃到飽餐廳', '咖啡館', '茶館', '飲酒店', '有娛樂節目餐廳'
+    ]
+
+    # 補給型清單
+    supply_type = [
+        '便當、自助餐店', '早餐店', '麵店、小吃店', '連鎖速食店', '餐食攤販', 
+        '調理飲料攤販', '手搖飲店', '其他飲料店']
+    
+    # 2. 建立副本以免影響原始傳入的變數 (良好的函式習慣)
+    df_result = df.copy()
+    
+    # 3. 初始化 '型態' 欄位，預設為 '其他'
+    df_result['型態'] = '其他'
+
+    # 4. 執行分類 (使用向量化操作加速)
+    # 判斷是否在目的型清單中
+    mask_dest = df_result[source_col].isin(destination_type)
+    df_result.loc[mask_dest, '型態'] = '目的型'
+    
+    # 判斷是否在補給型清單中
+    mask_supply = df_result[source_col].isin(supply_type)
+    df_result.loc[mask_supply, '型態'] = '補給型'
+    
+    return df_result
+
+
+#=====回補座標===================================
+def patch_coordinates(df: pd.DataFrame, 
+                      coord_batch: pd.DataFrame, 
+                      on_key: str = '統一編號') -> pd.DataFrame:
+    """
+    使用分批的座標資料來「更新」主資料表。
+    避免重複 merge 產生多餘欄位。
+    """
+    # 1. 建立副本，避免修改原始變數
+    df_result = df.copy()
+    
+    # 2. 定義我們要補的目標欄位
+    target_cols = ['coords_address', 'longitude', 'latitude']
+    
+    # 3. [關鍵步驟] 檢查主表是否已有這些欄位，沒有的話先創立空欄位
+    # 這是為了第一次執行時，確保欄位存在，後續才能 update
+    for col in target_cols:
+        if col not in df_result.columns:
+            df_result[col] = pd.NA  # 或 np.nan
+
+    # 4. 設定 Index 以便對齊
+    # update 是根據 Index 進行對應的，所以必須暫時將 Key 設為 Index
+    df_result = df_result.set_index(on_key)
+    batch_data = coord_batch.set_index(on_key)
+    
+    # 5. 過濾 Batch 資料
+    # 只取我們關心的欄位，避免 Batch 裡有其他雜訊欄位影響主表
+    # intersect 確保只取 batch 裡實際存在的目標欄位
+    cols_to_update = batch_data.columns.intersection(target_cols)
+    batch_subset = batch_data[cols_to_update]
+
+    # 6. 執行更新 (In-place update)
+    # 這會將 batch_subset 裡有的值，填入 df_result 對應的位置
+    df_result.update(batch_subset)
+    
+    # 7. 還原 Index 並回傳
+    return df_result.reset_index()
+
