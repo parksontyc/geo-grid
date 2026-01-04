@@ -146,6 +146,22 @@ def csv_extractor(file_name: str) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+#====新增轉換換欄位及地址解析等流程可以pipeline化===========
+def run_splitter_pipe(df, splitter_instance):
+    """
+    Adapter: 用於 pipe 中，處理 splitter 回傳的 tuple (df, changes)
+    """
+    # 呼叫原始方法
+    df_processed, changes = splitter_processed = splitter_instance.process(df)
+    
+    # 可以在這裡加入 log，例如：
+    # print(f"Splitter 完成，變動筆數: {len(changes)}")
+    
+    # 只回傳 df 以延續 pipe 鏈
+    return df_processed
+
+
+
 #=====新增及轉換欄位====================================   
 def convert_columns( df: pd.DataFrame) -> pd.DataFrame:
     # 新增「縣市」欄位
