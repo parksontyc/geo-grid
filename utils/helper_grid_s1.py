@@ -11,6 +11,8 @@ import geopandas as gpd
 from shapely.geometry import box
 import matplotlib.pyplot as plt
 
+import warnings
+
 
 # ================= 基礎工具 (保持不變) =================
 def read_vector(path): return gpd.read_file(path)
@@ -134,6 +136,102 @@ def build_projected_grid_generator(
             gc.collect()
 
     return gdf_proj, _grid_generator()
+
+
+#============網格建置流程============#
+def generate_joined_grids(
+    shp_path: str,
+    output_dir: str,
+    cell_size: int = 300,
+    county_col: str = 'COUNTYNAME'
+):
+    """
+    生成網格並與行政區進行空間連結（使用中心點法避免邊界重複）。
+    
+    Args:
+        shp_path (str): 縣市界線 SHP 檔案路徑。
+        output_dir (str): 輸出 Parquet 檔案的資料夾路徑。
+        cell_size (int): 網格大小 (公尺)，預設 300。
+        county_col (str): SHP 檔中縣市名稱的欄位，預設 'COUNTYNAME'。
+    """
+    
+    # 0. 環境設定
+    warnings.filterwarnings('ignore')
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"=== 開始執行任務: 網格大小 {cell_size}m ===")
+    print(f"來源: {shp_path}")
+    print(f"輸出: {out_dir}")
+
+    # 1. 呼叫產生器
+    # (假設 build_projected_grid_generator 已定義在您的環境中)
+    print("正在初始化網格產生器...")
+    gdf_tm2, grid_gen = build_projected_grid_generator(
+        shp_path,
+        cell_size=cell_size,
+        clip_mode="filter",
+        id_scheme="xy"
+    )
+
+    # 儲存基礎行政區資料 (作為對照用)
+    gdf_out_path = out_dir / "gdf_tm2_base.parquet"
+    gdf_tm2.to_parquet(gdf_out_path)
+    print(f"行政區底圖準備完成，共 {len(gdf_tm2)} 筆。")
+
+    # 2. 執行迴圈與空間連結
+    print("開始執行空間連結 (Spatial Join - Centroid Method)...")
+    
+    count = 0
+    for county_name, local_grid in grid_gen:
+        count += 1
+        print(f"-> [{count}] 處理中: {county_name} | 原始網格數: {len(local_grid):,}")
+
+        # --- A. 準備行政區資料 ---
+        # 篩選出該縣市的行政區
+        if county_col not in gdf_tm2.columns:
+            raise ValueError(f"欄位錯誤: SHP 中找不到 '{county_col}' 欄位，請檢查來源檔案。")
+            
+        local_admin = gdf_tm2[gdf_tm2[county_col] == county_name].copy()
+        
+        # --- B. 中心點法空間連結 ---
+        # 1. 備份原始方格幾何 (Polygon)
+        local_grid['poly_geom'] = local_grid.geometry
+        
+        # 2. 切換為中心點 (Point)
+        local_grid = local_grid.set_geometry(local_grid.centroid)
+        
+        # 3. 執行 sjoin (Point within Polygon)
+        joined_grid = gpd.sjoin(
+            local_grid, 
+            local_admin, 
+            how="inner", 
+            predicate="within"
+        )
+        
+        # --- C. 清理與復原 ---
+        # 1. 移除 sjoin 產生的索引
+        if 'index_right' in joined_grid.columns:
+            joined_grid = joined_grid.drop(columns=['index_right'])
+
+        # 2. 移除目前的幾何欄位 (Point) 以避免改名衝突
+        current_geo_col = joined_grid.geometry.name
+        joined_grid = joined_grid.drop(columns=[current_geo_col])
+        
+        # 3. 將備份的方格 (poly_geom) 改名回 'geometry' 並重新指定
+        joined_grid = joined_grid.rename(columns={'poly_geom': 'geometry'}).set_geometry('geometry')
+
+        print(f"   合併後: {len(joined_grid):,} (已歸屬行政區)")
+
+        # --- D. 存檔 ---
+        # 檔名包含網格大小，方便識別
+        out_filename = f"Grid_{county_name}_{cell_size}m_joined.parquet"
+        joined_grid.to_parquet(out_dir / out_filename)
+        
+        # 釋放記憶體
+        del local_grid, local_admin, joined_grid
+
+    print(f"=== 全部作業完成！共處理 {count} 個縣市 ===")
 
 
 #=====[[繪圖檢視]]=====#
